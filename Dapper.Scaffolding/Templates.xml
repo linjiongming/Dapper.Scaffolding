@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8" ?>
+<?xml version="1.0" encoding="utf-8" ?>
 <root>
   <data name="Solution" xml:space="preserve">
     <value>
@@ -2777,7 +2777,7 @@ namespace ${NR}$.Framework
 
         private string _connectionString;
 
-        public string ProviderName { get; set; }
+        public string ProviderName { get; private set; }
         public string ConnectionString
         {
             get
@@ -2792,7 +2792,7 @@ namespace ${NR}$.Framework
                 }
                 return _connectionString;
             }
-            set =&gt; _connectionString = value;
+            private set =&gt; _connectionString = value;
         }
 
         public Database() { }
@@ -3797,8 +3797,25 @@ namespace ${NR}$.Repositories
         protected const string DEFAULTUSERID = "timetrackpro";
         protected const string DEFAULTPASSWORD = "tp2000";
 
-        protected string ProviderName { get; set; }
-        protected string ConnectionString { get; set; }
+        private string _connectionString;
+
+        public string ProviderName { get; private set; }
+        public string ConnectionString
+        {
+            get
+            {
+                if (Regex.IsMatch(_connectionString, nameof(DEFAULTUSERID), RegexOptions.IgnoreCase))
+                {
+                    _connectionString = Regex.Replace(_connectionString, nameof(DEFAULTUSERID), DEFAULTUSERID, RegexOptions.IgnoreCase);
+                }
+                if (Regex.IsMatch(_connectionString, nameof(DEFAULTPASSWORD), RegexOptions.IgnoreCase))
+                {
+                    _connectionString = Regex.Replace(_connectionString, nameof(DEFAULTPASSWORD), DEFAULTPASSWORD, RegexOptions.IgnoreCase);
+                }
+                return _connectionString;
+            }
+            private set =&gt; _connectionString = value;
+        }
 
         public BaseRepository() : this(ConfigurationManager.AppSettings.Get("DefaultConnection"))
         {
@@ -3825,7 +3842,7 @@ namespace ${NR}$.Repositories
         {
             DbProviderFactory factory = GetProviderFactory();
             DbConnection conn = factory.CreateConnection();
-            conn.ConnectionString = Regex.Replace(Regex.Replace(ConnectionString, nameof(DEFAULTUSERID), DEFAULTUSERID, RegexOptions.IgnoreCase), nameof(DEFAULTPASSWORD), DEFAULTPASSWORD, RegexOptions.IgnoreCase);
+            conn.ConnectionString = ConnectionString;
             return conn;
         }
 
