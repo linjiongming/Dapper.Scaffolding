@@ -92,6 +92,7 @@ namespace Dapper.Scaffolding
                 }
             }
             Console.WriteLine("Done.");
+            System.Diagnostics.Process.Start("explorer.exe", OutputFolder);
         }
 
         static string Translate(string input)

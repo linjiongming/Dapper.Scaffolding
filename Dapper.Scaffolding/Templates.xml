@@ -405,35 +405,50 @@ namespace RabbitMQ.Client
         public const int MaxRetryCount = 3;
         public const string FailedFolder = "consume_failed";
 
-        protected readonly IDictionary&lt;string, object&gt; _replyProducerMap;
-
         public event EventHandler Disposed;
 
-        public IMqClient Client { get; }
-        public IConnection Connection { get; }
-        public IModel Channel { get; }
-        public string RoutingKey { get; }
-        public ExchangeModes ExchangeMode { get; }
-        public string QueueType { get; }
-        public uint Ttl { get; }
+        private IDictionary&lt;string, IMessageProducer&gt; _replyProducerMap;
 
-        public string BackupPath =&gt; Path.Combine(AppDomain.CurrentDomain.BaseDirectory, FailedFolder, DateTime.Today.ToString("yyyy-MM-dd"), $"{RoutingKey}.txt");
-        public EventingBasicConsumer Consumer { get; }
+        public List&lt;IRouteBinding&gt; Bindings { get; private set; }
+        public IMqClient Client { get; private set; }
+        public IConnection Connection { get; private set; }
+        public IModel Channel { get; private set; }
 
-        public MessageConsumer(IMqClient client, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public string GetBackupPath(string routingKey)
         {
-            _replyProducerMap = new Dictionary&lt;string, object&gt;();
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, FailedFolder, DateTime.Today.ToString("yyyy-MM-dd"), $"{routingKey}.txt");
+        }
 
+        public EventingBasicConsumer Consumer { get; private set; }
+
+        public MessageConsumer()
+        {
+        }
+
+        public MessageConsumer(IMqClient client) : this()
+        {
             Client = client;
-            RoutingKey = routingKey;
-            ExchangeMode = exchangeMode;
-            QueueType = queueType;
-            Ttl = ttl;
+            Initialize();
+        }
+
+        protected void Initialize()
+        {
+            _replyProducerMap = new Dictionary&lt;string, IMessageProducer&gt;();
+            Bindings = new List&lt;IRouteBinding&gt;();
             Connection = Client.CreateConnection();
             Channel = Connection.CreateModel();
-            Client.SetRoute(Channel, RoutingKey, exchangeMode, queueType, ttl);
             if (Client.Fairly) Channel.BasicQos(0, 1, false);
-            Consumer = new EventingBasicConsumer(Channel);
+        }
+
+        public IMessageConsumer Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        {
+            if (!Bindings.Any(x =&gt; x.RoutingKey == routingKey))
+            {
+                IRouteBinding binding = Client.SetRoute(Channel, routingKey, exchangeMode, queueType, ttl);
+                Bindings.Add(binding);
+                Disposed += (sender, e) =&gt; binding.Dispose();
+            }
+            return this;
         }
 
         public void Subscribe(Action&lt;IMessage&gt; handler)
@@ -443,88 +458,128 @@ namespace RabbitMQ.Client
 
         public void Subscribe(Func&lt;IMessage, object&gt; handler)
         {
-            Consumer.Received += (sender, e) =&gt;
+            ReceiveHandler = handler;
+            Consumer = new EventingBasicConsumer(Channel);
+            Consumer.Received += Consumer_Received;
+            Consumer.Shutdown += Consumer_Shutdown;
+            foreach (IRouteBinding bindInfo in Bindings)
             {
-                bool success = false;
-                object reply = null;
-                IMessage message = null;
-                try
+                Channel.BasicConsume(bindInfo.RoutingKey, false, Consumer);
+            }
+        }
+
+        protected Func&lt;IMessage, object&gt; ReceiveHandler { get; private set; }
+
+        private void Consumer_Received(object sender, BasicDeliverEventArgs e)
+        {
+            bool success = false;
+            object reply = null;
+            IMessage message = null;
+            IRouteBinding bindInfo = Bindings.FirstOrDefault(x =&gt; x.RoutingKey == e.RoutingKey);
+            try
+            {
+                message = new Message(e);
+                reply = ReceiveHandler(message);
+                if (!string.IsNullOrEmpty(message.ReplyTo))
                 {
-                    message = new Message(e);
-                    reply = handler(message);
-                    if (!string.IsNullOrEmpty(message.ReplyTo))
-                    {
-                        // 回发
-                        IMessageProducer replyProducer = GetReplyProducer(message.ReplyTo);
-                        replyProducer.Publish(reply.ToString(), message.CorrelationId);
-                        success = true;
-                    }
-                    else
-                    {
-                        success = reply is bool result ? result : true;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Trace.TraceError(ex.ToString());
-                }
-                if (success)
-                {
-                    // 消息确认 (销毁当前消息)
-                    Channel.BasicAck(e.DeliveryTag, false);
+                    // 回发
+                    IMessageProducer replyProducer = GetReplyProducer(message.ReplyTo);
+                    replyProducer.Publish(reply.ToString(), message.CorrelationId);
+                    success = true;
                 }
                 else
                 {
-                    if (ExchangeMode == ExchangeModes.DLX)
+                    if (reply == null) return;
+                    success = reply is bool result ? result : true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError(ex.ToString());
+            }
+            if (success)
+            {
+                // 消息确认 (销毁当前消息)
+                Channel.BasicAck(e.DeliveryTag, false);
+            }
+            else
+            {
+                if (bindInfo.ExchangeMode == ExchangeModes.DLX)
+                {
+                    long retryCount = GetRetryCount(e.BasicProperties.Headers); // 重试次数
+                    if (retryCount &lt; MaxRetryCount) // 最大重试次数内 转发给 Retry 交换机
                     {
-                        long retryCount = GetRetryCount(e.BasicProperties.Headers); // 重试次数
-                        if (retryCount &lt; MaxRetryCount) // 最大重试次数内 转发给 Retry 交换机
-                        {
-                            // 定义下一次投递的间隔时间 ms
-                            long interval = (retryCount + 1) * 10 * 1000 /*每多重试一次 增加10秒*/;
-                            e.BasicProperties.Expiration = interval.ToString();
+                        // 定义下一次投递的间隔时间 ms
+                        long interval = (retryCount + 1) * 10 * 1000 /*每多重试一次 增加10秒*/;
+                        e.BasicProperties.Expiration = interval.ToString();
 
-                            // 将消息投递给 Retry 交换机 (会自动增加 death 次数)
-                            Trace.TraceInformation("Retring...");
-                            Channel.BasicPublish(Client.ExchangeRetry, e.RoutingKey, e.BasicProperties, e.Body);
+                        // 将消息投递给 Retry 交换机 (会自动增加 death 次数)
+                        Trace.TraceInformation("Retring...");
+                        Channel.BasicPublish(Client.ExchangeRetry, e.RoutingKey, e.BasicProperties, e.Body);
 
-                            // 消息确认 (销毁当前消息)
-                            Channel.BasicAck(e.DeliveryTag, false);
-                        }
-                        else // 超过最大重试次数
-                        {
-                            // 消息拒绝 投递到死信交换机
-                            Trace.TraceInformation($"Deliver to DLX[CorrelationId:{e.BasicProperties.CorrelationId}]");
-                            Channel.BasicNack(e.DeliveryTag, false, false);
-
-                            // 备份到本地
-                            Trace.TraceInformation("Backup...");
-                            message.Backup(BackupPath);
-                        }
+                        // 消息确认 (销毁当前消息)
+                        Channel.BasicAck(e.DeliveryTag, false);
                     }
-                    else
+                    else // 超过最大重试次数
                     {
-                        // 消息拒绝
-                        Trace.TraceInformation($"Nack message[CorrelationId:{e.BasicProperties.CorrelationId}]");
+                        // 消息拒绝 投递到死信交换机
+                        Trace.TraceInformation($"Deliver to DLX[CorrelationId:{e.BasicProperties.CorrelationId}]");
                         Channel.BasicNack(e.DeliveryTag, false, false);
 
                         // 备份到本地
                         Trace.TraceInformation("Backup...");
-                        message.Backup(BackupPath);
+                        message.Backup(GetBackupPath(e.RoutingKey));
                     }
                 }
-            };
-            Channel.BasicConsume(RoutingKey, false, Consumer);
+                else
+                {
+                    // 消息拒绝
+                    Trace.TraceInformation($"Nack message[CorrelationId:{e.BasicProperties.CorrelationId}]");
+                    Channel.BasicNack(e.DeliveryTag, false, false);
+
+                    // 备份到本地
+                    Trace.TraceInformation("Backup...");
+                    message.Backup(GetBackupPath(e.RoutingKey));
+                }
+            }
+        }
+
+        private void Consumer_Shutdown(object sender, ShutdownEventArgs e)
+        {
+            Trace.TraceInformation($"{nameof(MessageConsumer)}[{string.Join(",", Bindings.Select(x =&gt; x.RoutingKey))}] is off. Cause {(e.Cause is Exception ex ? ex.Message : e.Cause.ToString())}");
+            Dispose(true);
+            Reboot();
+        }
+
+        private void Reboot()
+        {
+            Trace.TraceInformation($"{nameof(MessageConsumer)}[{string.Join(",", Bindings.Select(x =&gt; x.RoutingKey))}] rebooting...");
+            while (!Client.TestConnection())
+            {
+                Thread.Sleep(TimeSpan.FromSeconds(5));
+            }
+            Trace.TraceInformation($"{nameof(MessageConsumer)}[{string.Join(",", Bindings.Select(x =&gt; x.RoutingKey))}] has rebooted.");
+            IRouteBinding[] cloneBindings = new IRouteBinding[Bindings.Count];
+            Bindings.CopyTo(cloneBindings);
+            Initialize();
+            foreach (var binding in cloneBindings)
+            {
+                Bind(binding.RoutingKey, binding.ExchangeMode, binding.QueueType, binding.TimeToLive);
+            }
+            if (ReceiveHandler != null)
+            {
+                Subscribe(ReceiveHandler);
+            }
         }
 
         private IMessageProducer GetReplyProducer(string replyTo)
         {
-            if (_replyProducerMap.TryGetValue(replyTo, out object producer))
+            if (_replyProducerMap.TryGetValue(replyTo, out IMessageProducer producer))
             {
-                return producer as IMessageProducer;
+                return producer;
             }
-            IMessageProducer replyProducer = new MessageProducer(Client, replyTo);
-            Disposed += delegate { replyProducer?.Dispose(); };
+            IMessageProducer replyProducer = new MessageProducer(Client).Bind(replyTo);
+            Disposed += (sender, e) =&gt; replyProducer?.Dispose();
             lock (_replyProducerMap)
             {
                 _replyProducerMap[replyTo] = replyProducer;
@@ -546,21 +601,39 @@ namespace RabbitMQ.Client
         {
             if (disposing)
             {
-                Channel?.Dispose();
-                Connection?.Dispose();
-                Disposed?.Invoke(this, EventArgs.Empty);
+                if (Consumer != null)
+                {
+                    Consumer.Received -= Consumer_Received;
+                    Consumer.Shutdown -= Consumer_Shutdown;
+                    Consumer = null;
+                }
+                if (Channel != null)
+                {
+                    Channel.Dispose();
+                    Channel = null;
+                }
+                if (Connection != null)
+                {
+                    Connection.Dispose();
+                    Connection = null;
+                }
+                if (Disposed != null)
+                {
+                    Disposed.Invoke(this, EventArgs.Empty);
+                    Disposed = null;
+                }
             }
         }
 
         public void Dispose()
         {
             Dispose(true);
+            GC.SuppressFinalize(this);
         }
 
         ~MessageConsumer()
         {
             Dispose(false);
-            GC.SuppressFinalize(this);
         }
     }
 }</value>
@@ -671,6 +744,7 @@ namespace RabbitMQ.Client
     &lt;Compile Include="RabbitMQ.Client\MqClient.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\RemoteProcedure.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\RemoteProcedure`2.cs" /&gt;
+    &lt;Compile Include="RabbitMQ.Client\RouteBinding.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\Roles\IMessage.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\Roles\IMessageConsumer.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\Roles\IMessageConsumer`1.cs" /&gt;
@@ -682,6 +756,7 @@ namespace RabbitMQ.Client
     &lt;Compile Include="RabbitMQ.Client\Roles\IMqClient.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\Roles\IRemoteProcedure.cs" /&gt;
     &lt;Compile Include="RabbitMQ.Client\Roles\IRemoteProcedure`2.cs" /&gt;
+    &lt;Compile Include="RabbitMQ.Client\Roles\IRouteBinding.cs" /&gt;
     &lt;Compile Include="System.Diagnostics\DailyErrorLogger.cs" /&gt;
     &lt;Compile Include="System.Diagnostics\DailyInfoLogger.cs" /&gt;
     &lt;Compile Include="System.Diagnostics\DailyLogger.cs" /&gt;
@@ -714,9 +789,15 @@ namespace RabbitMQ.Client
 {
     public class MessageConsumer&lt;T&gt; : MessageConsumer, IMessageConsumer&lt;T&gt;
     {
-        public MessageConsumer(IMqClient client, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
-            : base(client, routingKey, exchangeMode, queueType, ttl)
+        public MessageConsumer(IMqClient client)
+            : base(client)
         {
+        }
+
+        public new IMessageConsumer&lt;T&gt; Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        {
+            base.Bind(routingKey, exchangeMode, queueType, ttl);
+            return this;
         }
 
         public void Subscribe(Action&lt;IMessage&lt;T&gt;&gt; handler)
@@ -742,6 +823,7 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace RabbitMQ.Client
@@ -751,42 +833,58 @@ namespace RabbitMQ.Client
         public const int MaxRetryCount = 3;
         public const string FailedFolder = "publish_failed";
 
-        private readonly List&lt;IMessage&gt; _msgList;
-        private readonly Dictionary&lt;string, int&gt; _retryMap;
+        private List&lt;IMessage&gt; _publishTemp;
+        private Dictionary&lt;string, int&gt; _retryMap;
         private string _replyTo;
 
         public event EventHandler Disposed;
         public event Action&lt;string&gt; PublishSuccess;
         public event Action&lt;string&gt; PublishFailed;
 
-        public IMqClient Client { get; }
-        public IConnection Connection { get; }
-        public IModel Channel { get; }
-        public string RoutingKey { get; }
-        public ExchangeModes ExchangeMode { get; }
-        public string QueueType { get; }
-        public uint Ttl { get; }
+        public List&lt;IRouteBinding&gt; Bindings { get; private set; }
+        public IMqClient Client { get; private set; }
+        public IConnection Connection { get; private set; }
+        public IModel Channel { get; private set; }
 
-        public string BackupPath =&gt; Path.Combine(AppDomain.CurrentDomain.BaseDirectory, FailedFolder, DateTime.Today.ToString("yyyy-MM-dd"), $"{RoutingKey}.txt");
-
-        public MessageProducer() { }
-
-        public MessageProducer(IMqClient client, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public MessageProducer()
         {
-            _msgList = new List&lt;IMessage&gt;();
-            _retryMap = new Dictionary&lt;string, int&gt;();
+        }
 
+        public MessageProducer(IMqClient client) : this()
+        {
             Client = client;
-            RoutingKey = routingKey;
-            ExchangeMode = exchangeMode;
-            QueueType = queueType;
-            Ttl = ttl;
+            Initialize();
+        }
+
+        protected void Initialize()
+        {
+            _publishTemp = new List&lt;IMessage&gt;();
+            _retryMap = new Dictionary&lt;string, int&gt;();
+            Bindings = new List&lt;IRouteBinding&gt;();
             Connection = Client.CreateConnection();
             Channel = Connection.CreateModel();
-            Client.SetRoute(Channel, RoutingKey, exchangeMode, queueType, ttl);
+            Channel.ModelShutdown += Channel_ModelShutdown;
             Channel.BasicAcks += Channel_BasicAcks;
             Channel.BasicNacks += Channel_BasicNacks;
             Channel.ConfirmSelect();
+        }
+
+        private void Channel_ModelShutdown(object sender, ShutdownEventArgs e)
+        {
+            Trace.TraceInformation($"{nameof(MessageProducer)}[{string.Join(",", Bindings.Select(x =&gt; x.RoutingKey))}] is off. Cause {(e.Cause is Exception ex ? ex.Message : e.Cause.ToString())}");
+            Dispose(true);
+            Reboot();
+        }
+
+        public IMessageProducer Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        {
+            if (!Bindings.Any(x =&gt; x.RoutingKey == routingKey))
+            {
+                IRouteBinding binding = Client.SetRoute(Channel, routingKey, exchangeMode, queueType, ttl);
+                Bindings.Add(binding);
+                Disposed += (sender, e) =&gt; binding.Dispose();
+            }
+            return this;
         }
 
         public IMessage Publish(string content, string correlationId = null)
@@ -798,9 +896,9 @@ namespace RabbitMQ.Client
 
         protected void Publish(IMessage message)
         {
-            lock (_msgList)
+            lock (_publishTemp)
             {
-                _msgList.Add(message);
+                _publishTemp.Add(message);
             }
             IBasicProperties props = Channel.CreateBasicProperties();
             {
@@ -809,22 +907,38 @@ namespace RabbitMQ.Client
                 if (!string.IsNullOrEmpty(_replyTo)) props.ReplyTo = _replyTo;
             }
             message.DeliveryTag = Channel.NextPublishSeqNo;
-            Channel.BasicPublish(Client.Exchange, RoutingKey, props, message.Body);
+            foreach (IRouteBinding bindInfo in Bindings)
+            {
+                Channel.BasicPublish(Client.Exchange, bindInfo.RoutingKey, props, message.Body);
+            }
         }
 
-        public IMessageProducer ReplyTo(Func&lt;IMessage, object&gt; callback, string replyTo = null)
+        public IMessageProducer ReplyTo(string replyTo)
         {
-            IMessageConsumer consumer = null;
-            Disposed += delegate { consumer?.Dispose(); };
-            _replyTo = replyTo ?? $"r.{RoutingKey}";
-            consumer = new MessageConsumer(Client, _replyTo, ExchangeMode, QueueType, Ttl);
-            consumer.Subscribe(callback);
+            _replyTo = replyTo;
             return this;
         }
 
         public void WaitForConfirmsOrDie(TimeSpan timeout)
         {
             Channel.WaitForConfirmsOrDie(timeout);
+        }
+
+        private void Reboot()
+        {
+            Trace.TraceInformation($"{nameof(MessageProducer)}[{string.Join(",", Bindings.Select(x =&gt; x.RoutingKey))}] rebooting...");
+            while (!Client.TestConnection())
+            {
+                Thread.Sleep(TimeSpan.FromSeconds(5));
+            }
+            Trace.TraceInformation($"{nameof(MessageProducer)}[{string.Join(",", Bindings.Select(x =&gt; x.RoutingKey))}] has rebooted.");
+            IRouteBinding[] cloneBindings = new IRouteBinding[Bindings.Count];
+            Bindings.CopyTo(cloneBindings);
+            Initialize();
+            foreach (var binding in cloneBindings)
+            {
+                Bind(binding.RoutingKey, binding.ExchangeMode, binding.QueueType, binding.TimeToLive);
+            }
         }
 
         /// &lt;summary&gt;
@@ -846,12 +960,12 @@ namespace RabbitMQ.Client
 
         private void Acks(Func&lt;IMessage, bool&gt; predicate)
         {
-            var msgs = _msgList.Where(predicate).ToList();
+            var msgs = _publishTemp.Where(predicate).ToList();
             foreach (var msg in msgs)
             {
-                lock (_msgList)
+                lock (_publishTemp)
                 {
-                    _msgList.Remove(msg); // 从列表中删除
+                    _publishTemp.Remove(msg); // 从列表中删除
                 }
                 PublishSuccess?.Invoke(msg.CorrelationId);
             }
@@ -877,12 +991,12 @@ namespace RabbitMQ.Client
 
         private void Nacks(Func&lt;IMessage, bool&gt; predicate)
         {
-            var msgs = _msgList.Where(predicate).ToList();
+            var msgs = _publishTemp.Where(predicate).ToList();
             foreach (var msg in msgs)
             {
-                lock (_msgList)
+                lock (_publishTemp)
                 {
-                    _msgList.Remove(msg); // 从列表中删除
+                    _publishTemp.Remove(msg); // 从列表中删除
                 }
                 if (!_retryMap.ContainsKey(msg.CorrelationId)) _retryMap[msg.CorrelationId] = 0;
                 if (_retryMap[msg.CorrelationId] &lt; MaxRetryCount) // 最大重试次数内 
@@ -894,19 +1008,42 @@ namespace RabbitMQ.Client
                 else // 超过最大重试次数
                 {
                     Trace.TraceInformation("Backup...");
-                    msg.Backup(BackupPath); // 备份到本地
+                    foreach (IRouteBinding bindInfo in Bindings)
+                    {
+                        msg.Backup(GetBackupPath(bindInfo.RoutingKey)); // 备份到本地
+                    }
                     PublishFailed?.Invoke(msg.CorrelationId);
                 }
             }
+        }
+
+        private string GetBackupPath(string routingKey)
+        {
+            return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, FailedFolder, DateTime.Today.ToString("yyyy-MM-dd"), $"{routingKey}.txt");
         }
 
         protected virtual void Dispose(bool disposing)
         {
             if (disposing)
             {
-                Channel.Dispose();
-                Connection.Dispose();
-                Disposed?.Invoke(this, EventArgs.Empty);
+                if (Channel != null)
+                {
+                    Channel.ModelShutdown -= Channel_ModelShutdown;
+                    Channel.BasicAcks -= Channel_BasicAcks;
+                    Channel.BasicNacks -= Channel_BasicNacks;
+                    Channel.Dispose();
+                    Channel = null;
+                }
+                if (Connection != null)
+                {
+                    Connection.Dispose();
+                    Connection = null;
+                }
+                if (Disposed != null)
+                {
+                    Disposed.Invoke(this, EventArgs.Empty);
+                    Disposed = null;
+                }
             }
         }
 
@@ -940,9 +1077,15 @@ namespace RabbitMQ.Client
 {
     public class MessageProducer&lt;T&gt; : MessageProducer, IMessageProducer&lt;T&gt;
     {
-        public MessageProducer(IMqClient client, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
-            : base(client, routingKey, exchangeMode, queueType, ttl)
+        public MessageProducer(IMqClient client)
+            : base(client)
         {
+        }
+
+        public new IMessageProducer&lt;T&gt; Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        {
+            base.Bind(routingKey, exchangeMode, queueType, ttl);
+            return this;
         }
 
         public IMessage&lt;T&gt; Publish(T value, string correlationId = null)
@@ -950,12 +1093,6 @@ namespace RabbitMQ.Client
             IMessage&lt;T&gt; message = new Message&lt;T&gt;(value, correlationId);
             base.Publish(message);
             return message;
-        }
-
-        public IMessageProducer&lt;T&gt; ReplyTo&lt;TReply&gt;(Func&lt;IMessage&lt;TReply&gt;, bool&gt; callback, string replyTo = null)
-        {
-            base.ReplyTo(x =&gt; callback(x.Cast&lt;TReply&gt;()), replyTo);
-            return this;
         }
     }
 }</value>
@@ -1182,34 +1319,47 @@ namespace RabbitMQ.Client
             return connection;
         }
 
-        public IMessageProducer CreateProducer(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public bool TestConnection()
         {
-            return new MessageProducer(this, routingKey, exchangeMode, queueType, ttl);
+            try
+            {
+                using (CreateConnection()) { }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
-        public IMessageProducer&lt;T&gt; CreateProducer&lt;T&gt;(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public IMessageProducer CreateProducer()
         {
-            return new MessageProducer&lt;T&gt;(this, routingKey, exchangeMode, queueType, ttl);
+            return new MessageProducer(this);
         }
 
-        public IMessageConsumer CreateConsumer(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public IMessageProducer&lt;T&gt; CreateProducer&lt;T&gt;()
         {
-            return new MessageConsumer(this, routingKey, exchangeMode, queueType, ttl);
+            return new MessageProducer&lt;T&gt;(this);
         }
 
-        public IMessageConsumer&lt;T&gt; CreateConsumer&lt;T&gt;(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public IMessageConsumer CreateConsumer()
         {
-            return new MessageConsumer&lt;T&gt;(this, routingKey, exchangeMode, queueType, ttl);
+            return new MessageConsumer(this);
         }
 
-        public IRemoteProcedure CreateRemoteProcedure(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public IMessageConsumer&lt;T&gt; CreateConsumer&lt;T&gt;()
         {
-            return new RemoteProcedure(this, routingKey, exchangeMode, queueType, ttl);
+            return new MessageConsumer&lt;T&gt;(this);
         }
 
-        public IRemoteProcedure&lt;TSource, TResult&gt; CreateRemoteProcedure&lt;TSource, TResult&gt;(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public IRemoteProcedure CreateRemoteProcedure()
         {
-            return new RemoteProcedure&lt;TSource, TResult&gt;(this, routingKey, exchangeMode, queueType, ttl);
+            return new RemoteProcedure(this);
+        }
+
+        public IRemoteProcedure&lt;TSource, TResult&gt; CreateRemoteProcedure&lt;TSource, TResult&gt;()
+        {
+            return new RemoteProcedure&lt;TSource, TResult&gt;(this);
         }
 
         public IMessageQueue GetMessageQueue(string queue, string queueType = null, uint ttl = 0)
@@ -1222,16 +1372,18 @@ namespace RabbitMQ.Client
             return new MessageQueue&lt;T&gt;(this, queue, queueType, ttl);
         }
 
-        public void SetRoute(IModel channel, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public IRouteBinding SetRoute(IModel channel, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
         {
             string queue = $"{routingKey}";
 
             IDictionary&lt;string, object&gt; args = new Dictionary&lt;string, object&gt;();
             {
                 if (!string.IsNullOrWhiteSpace(queueType))
-                    args.Add(ArgumentKeys.QueueType, queueType);
+                    args[ArgumentKeys.QueueType] = queueType;
                 if (ttl &gt; 0)
-                    args.Add(ArgumentKeys.TimeToLive, ttl);
+                    args[ArgumentKeys.TimeToLive] = ttl;
+                if (exchangeMode == ExchangeModes.DLX)
+                    args[ArgumentKeys.DeadLetterExchange] = ExchangeFailed;         // 指定死信交换机，用于将 Noraml 队列中失败的消息投递给 Failed 交换机
             }
 
             channel.ExchangeDeclare(Exchange, ExchangeType, Durable, false, null);
@@ -1242,8 +1394,6 @@ namespace RabbitMQ.Client
             {
                 string queueRetry = $"{routingKey}.retry";
                 string queueFailed = $"{routingKey}.failed";
-
-                args[ArgumentKeys.DeadLetterExchange] = ExchangeFailed;         // 指定死信交换机，用于将 Noraml 队列中失败的消息投递给 Failed 交换机
 
                 IDictionary&lt;string, object&gt; retryArgs = new Dictionary&lt;string, object&gt;();
                 {
@@ -1268,7 +1418,10 @@ namespace RabbitMQ.Client
                 channel.QueueDeclare(queueFailed, Durable, false, false, failedArgs);
                 channel.QueueBind(queueFailed, ExchangeFailed, routingKey);
             }
+
+            return new RouteBinding(channel, routingKey, exchangeMode, queueType, ttl);
         }
+
     }
 }</value>
     <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\MqClient.cs</comment>
@@ -1287,33 +1440,43 @@ namespace RabbitMQ.Client
 {
     public class RemoteProcedure : IRemoteProcedure
     {
-        protected readonly List&lt;IMessage&gt; _resultList;
-        protected readonly Dictionary&lt;string, AutoResetEvent&gt; _waitMap;
+        private readonly List&lt;IMessage&gt; _resultList;
+        private readonly Dictionary&lt;string, AutoResetEvent&gt; _waitMap;
 
         public event EventHandler Disposed;
 
         public IMqClient Client { get; }
 
-        public string RoutingKey { get; }
-        public ExchangeModes ExchangeMode { get; }
-        public string QueueType { get; }
-        public uint Ttl { get; }
         private IMessageProducer Producer { get; set; }
         private IMessageConsumer Consumer { get; set; }
+        private IMessageConsumer ReplyConsumer { get; set; }
 
-        public RemoteProcedure(IMqClient client, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        public RemoteProcedure(IMqClient client)
         {
             _resultList = new List&lt;IMessage&gt;();
             _waitMap = new Dictionary&lt;string, AutoResetEvent&gt;();
 
             Client = client;
-            RoutingKey = routingKey;
-            ExchangeMode = exchangeMode;
-            QueueType = queueType;
-            Ttl = ttl;
+            Producer = Client.CreateProducer();
+            Consumer = client.CreateConsumer();
+            ReplyConsumer = client.CreateConsumer();
         }
 
-        protected virtual bool Reply(IMessage result)
+        public IRemoteProcedure Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        {
+            if (!Producer.Bindings.Any(x =&gt; x.RoutingKey == routingKey))
+            {
+                Producer.Bind(routingKey, exchangeMode, queueType, ttl);
+                Consumer.Bind(routingKey, exchangeMode, queueType, ttl);
+                string replyRoutingKey = $"r.{routingKey}";
+                Producer.ReplyTo(replyRoutingKey);
+                ReplyConsumer.Bind(replyRoutingKey, exchangeMode, queueType, ttl);
+                ReplyConsumer.Subscribe(x =&gt; Reply(x));
+            }
+            return this;
+        }
+
+        private bool Reply(IMessage result)
         {
             if (_waitMap.ContainsKey(result.CorrelationId))
             {
@@ -1327,14 +1490,8 @@ namespace RabbitMQ.Client
             return false;
         }
 
-        public virtual string Call(string content, int timeout = 30 * 1000)
+        public string Call(string content, int timeout = 30 * 1000)
         {
-            if (Producer == null)
-            {
-                Producer = new MessageProducer(Client, RoutingKey, ExchangeMode, QueueType, Ttl);
-                Disposed += delegate { Producer?.Dispose(); };
-                Producer.ReplyTo(x =&gt; Reply(x));
-            }
             IMessage message = Producer.Publish(content);
             lock (_waitMap)
             {
@@ -1360,7 +1517,7 @@ namespace RabbitMQ.Client
             }
             else
             {
-                Trace.TraceError($"RemoteProcedure[{RoutingKey}] answer timeout.");
+                Trace.TraceError($"RemoteProcedure[{string.Join(",", Producer.Bindings.Select(x =&gt; x.RoutingKey))}] answer timeout.");
             }
             return null;
         }
@@ -1372,11 +1529,6 @@ namespace RabbitMQ.Client
 
         public void Answer(Func&lt;IMessage, string&gt; handler)
         {
-            if (Consumer == null)
-            {
-                Consumer = new MessageConsumer(Client, RoutingKey, ExchangeMode, QueueType, Ttl);
-                Disposed += delegate { Consumer?.Dispose(); };
-            }
             Consumer.Subscribe(handler);
         }
 
@@ -1384,6 +1536,9 @@ namespace RabbitMQ.Client
         {
             if (disposing)
             {
+                Producer.Dispose();
+                ReplyConsumer.Dispose();
+                Consumer.Dispose();
                 Disposed?.Invoke(this, EventArgs.Empty);
             }
         }
@@ -1402,7 +1557,7 @@ namespace RabbitMQ.Client
 }</value>
     <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\RemoteProcedure.cs</comment>
   </data>
-  <data name="Framework_RabbitMQ_Client_RemoteProcedure_1_cs" xml:space="preserve">
+  <data name="Framework_RabbitMQ_Client_RemoteProcedure_2_cs" xml:space="preserve">
     <value>using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -1414,24 +1569,60 @@ using System.Threading.Tasks;
 
 namespace RabbitMQ.Client
 {
-    public class RemoteProcedure&lt;TSource, TResult&gt; : RemoteProcedure, IRemoteProcedure&lt;TSource, TResult&gt;
+    public class RemoteProcedure&lt;TSource, TResult&gt; : IRemoteProcedure&lt;TSource, TResult&gt;
     {
+        private readonly List&lt;IMessage&gt; _resultList;
+        private readonly Dictionary&lt;string, AutoResetEvent&gt; _waitMap;
+
+        public event EventHandler Disposed;
+
+        public IMqClient Client { get; }
+
         private IMessageProducer&lt;TSource&gt; Producer { get; set; }
         private IMessageConsumer&lt;TSource&gt; Consumer { get; set; }
+        private IMessageConsumer&lt;TResult&gt; ReplyConsumer { get; set; }
 
-        public RemoteProcedure(IMqClient client, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
-            : base(client, routingKey, exchangeMode, queueType, ttl)
+        public RemoteProcedure(IMqClient client)
         {
+            _resultList = new List&lt;IMessage&gt;();
+            _waitMap = new Dictionary&lt;string, AutoResetEvent&gt;();
+
+            Client = client;
+            Producer = Client.CreateProducer&lt;TSource&gt;();
+            Consumer = client.CreateConsumer&lt;TSource&gt;();
+            ReplyConsumer = client.CreateConsumer&lt;TResult&gt;();
+        }
+
+        public IRemoteProcedure&lt;TSource, TResult&gt; Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0)
+        {
+            if (!Producer.Bindings.Any(x =&gt; x.RoutingKey == routingKey))
+            {
+                Producer.Bind(routingKey, exchangeMode, queueType, ttl);
+                Consumer.Bind(routingKey, exchangeMode, queueType, ttl);
+                string replyRoutingKey = $"r.{routingKey}";
+                Producer.ReplyTo(replyRoutingKey);
+                ReplyConsumer.Bind(replyRoutingKey, exchangeMode, queueType, ttl);
+                ReplyConsumer.Subscribe(x =&gt; Reply(x));
+            }
+            return this;
+        }
+
+        private bool Reply(IMessage&lt;TResult&gt; result)
+        {
+            if (_waitMap.ContainsKey(result.CorrelationId))
+            {
+                lock (_resultList)
+                {
+                    _resultList.Add(result);
+                }
+                _waitMap[result.CorrelationId].Set();
+                return true;
+            }
+            return false;
         }
 
         public TResult Call(TSource source, int timeout = 30 * 1000)
         {
-            if (Producer == null)
-            {
-                Producer = new MessageProducer&lt;TSource&gt;(Client, RoutingKey, ExchangeMode, QueueType, Ttl);
-                Disposed += delegate { Producer?.Dispose(); };
-                Producer.ReplyTo&lt;TResult&gt;(Reply);
-            }
             IMessage message = Producer.Publish(source);
             lock (_waitMap)
             {
@@ -1457,7 +1648,7 @@ namespace RabbitMQ.Client
             }
             else
             {
-                Trace.TraceError($"RemoteProcedure[{RoutingKey}] answer timeout.");
+                Trace.TraceError($"RemoteProcedure[{string.Join(",", Producer.Bindings.Select(x =&gt; x.RoutingKey))}] answer timeout.");
             }
             return default(TResult);
         }
@@ -1469,16 +1660,125 @@ namespace RabbitMQ.Client
 
         public void Answer(Func&lt;IMessage&lt;TSource&gt;, TResult&gt; handler)
         {
-            if (Consumer == null)
-            {
-                Consumer = new MessageConsumer&lt;TSource&gt;(Client, RoutingKey, ExchangeMode, QueueType, Ttl);
-                Disposed += delegate { Consumer?.Dispose(); };
-            }
             Consumer.Subscribe(handler);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                Producer.Dispose();
+                ReplyConsumer.Dispose();
+                Consumer.Dispose();
+                Disposed?.Invoke(this, EventArgs.Empty);
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+        }
+
+        ~RemoteProcedure()
+        {
+            Dispose(false);
+            GC.SuppressFinalize(this);
         }
     }
 }</value>
     <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\RemoteProcedure`2.cs</comment>
+  </data>
+  <data name="Framework_RabbitMQ_Client_RouteBinding_cs" xml:space="preserve">
+    <value>using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using RabbitMQ.Client;
+
+namespace RabbitMQ.Client
+{
+    public class RouteBinding : IRouteBinding
+    {
+        public IModel Channel { get; }
+        public string RoutingKey { get; private set; }
+        public ExchangeModes ExchangeMode { get; }
+        public string QueueType { get; }
+        public uint TimeToLive { get; }
+        public uint MessageCount { get; set; }
+        protected CancellationTokenSource Cancellation { get; private set; }
+        protected Task Holder { get; private set; }
+
+        public RouteBinding(IModel channel, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint timeToLive = 0)
+        {
+            Channel = channel;
+            RoutingKey = routingKey;
+            ExchangeMode = exchangeMode;
+            QueueType = queueType;
+            TimeToLive = timeToLive;
+            LoadHolder();
+        }
+
+        protected void LoadHolder()
+        {
+            UnloadHolder();
+            Cancellation = new CancellationTokenSource();
+            Holder = Task.Run(delegate
+            {
+                while (Channel.IsOpen)
+                {
+                    Refresh();
+                    Thread.Sleep(TimeSpan.FromSeconds(1));
+                }
+            }, Cancellation.Token);
+        }
+
+        protected void UnloadHolder()
+        {
+            if (Holder == null) return;
+            if (!Holder.Wait(TimeSpan.FromSeconds(2)))
+            {
+                Cancellation.Cancel();
+            }
+            Holder.Dispose();
+            Holder = null;
+        }
+
+        protected void Refresh()
+        {
+            try
+            {
+                MessageCount = Channel.QueueDeclarePassive(RoutingKey).MessageCount;
+            }
+            catch (Exception ex)
+            {
+                Trace.TraceError(ex.ToString());
+            }
+        }
+
+        ~RouteBinding()
+        {
+            Dispose(false);
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                UnloadHolder();
+            }
+        }
+    }
+}</value>
+    <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\RouteBinding.cs</comment>
   </data>
   <data name="Framework_RabbitMQ_Client_Roles_IMessage_cs" xml:space="preserve">
     <value>using Newtonsoft.Json;
@@ -1619,6 +1919,7 @@ namespace RabbitMQ.Client
   <data name="Framework_RabbitMQ_Client_Roles_IMessageConsumer_cs" xml:space="preserve">
     <value>using RabbitMQ.Client.Events;
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 
 namespace RabbitMQ.Client
@@ -1646,24 +1947,19 @@ namespace RabbitMQ.Client
         IModel Channel { get; }
 
         /// &lt;summary&gt;
-        /// 路由键
+        /// 绑定信息
         /// &lt;/summary&gt;
-        string RoutingKey { get; }
+        List&lt;IRouteBinding&gt; Bindings { get; }
 
         /// &lt;summary&gt;
-        /// 交换模式
+        /// 绑定队列
         /// &lt;/summary&gt;
-        ExchangeModes ExchangeMode { get; }
-
-        /// &lt;summary&gt;
-        /// 队列类型
-        /// &lt;/summary&gt;
-        string QueueType { get; }
-
-        /// &lt;summary&gt;
-        /// 消息存活时间
-        /// &lt;/summary&gt;
-        uint Ttl { get; }
+        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
+        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
+        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
+        /// &lt;param name="ttl"&gt;最大存活时长&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        IMessageConsumer Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
 
         /// &lt;summary&gt;
         /// 订阅
@@ -1692,6 +1988,16 @@ namespace RabbitMQ.Client
     public interface IMessageConsumer&lt;T&gt; : IMessageConsumer
     {
         /// &lt;summary&gt;
+        /// 绑定队列
+        /// &lt;/summary&gt;
+        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
+        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
+        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
+        /// &lt;param name="ttl"&gt;最大存活时长&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        new IMessageConsumer&lt;T&gt; Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+
+        /// &lt;summary&gt;
         /// 订阅
         /// &lt;/summary&gt;
         /// &lt;param name="handler"&gt;消息处理方法&lt;/param&gt;
@@ -1708,6 +2014,7 @@ namespace RabbitMQ.Client
   </data>
   <data name="Framework_RabbitMQ_Client_Roles_IMessageProducer_cs" xml:space="preserve">
     <value>using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 
 namespace RabbitMQ.Client
@@ -1737,24 +2044,19 @@ namespace RabbitMQ.Client
         IModel Channel { get; }
 
         /// &lt;summary&gt;
-        /// 路由键
+        /// 绑定信息
         /// &lt;/summary&gt;
-        string RoutingKey { get; }
+        List&lt;IRouteBinding&gt; Bindings { get; }
 
         /// &lt;summary&gt;
-        /// 交换模式
+        /// 绑定队列
         /// &lt;/summary&gt;
-        ExchangeModes ExchangeMode { get; }
-
-        /// &lt;summary&gt;
-        /// 队列类型
-        /// &lt;/summary&gt;
-        string QueueType { get; }
-
-        /// &lt;summary&gt;
-        /// 消息存活时间
-        /// &lt;/summary&gt;
-        uint Ttl { get; }
+        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
+        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
+        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
+        /// &lt;param name="ttl"&gt;最大存活时长&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        IMessageProducer Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
 
         /// &lt;summary&gt;
         /// 发布
@@ -1767,10 +2069,8 @@ namespace RabbitMQ.Client
         /// &lt;summary&gt;
         /// 回发
         /// &lt;/summary&gt;
-        /// &lt;typeparam name="TReply"&gt;回发消息类型&lt;/typeparam&gt;
-        /// &lt;param name="callback"&gt;回调函数&lt;/param&gt;
-        /// &lt;param name="replyRoutingKey"&gt;回发路由键 (默认: r.routingKey)&lt;/param&gt;
-        IMessageProducer ReplyTo(Func&lt;IMessage, object&gt; callback, string replyRoutingKey = null);
+        /// &lt;param name="replyRoutingKey"&gt;回发路由键&lt;/param&gt;
+        IMessageProducer ReplyTo(string replyRoutingKey);
 
         /// &lt;summary&gt;
         /// 等待确认
@@ -1793,20 +2093,23 @@ namespace RabbitMQ.Client
     public interface IMessageProducer&lt;T&gt; : IMessageProducer
     {
         /// &lt;summary&gt;
+        /// 绑定队列
+        /// &lt;/summary&gt;
+        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
+        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
+        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
+        /// &lt;param name="ttl"&gt;最大存活时长&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        new IMessageProducer&lt;T&gt; Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+
+
+        /// &lt;summary&gt;
         /// 发布
         /// &lt;/summary&gt;
         /// &lt;param name="message"&gt;消息&lt;/param&gt;
         /// &lt;param name="correlationId"&gt;相关ID&lt;/param&gt;
         /// &lt;returns&gt;消息实体&lt;/returns&gt;
         IMessage&lt;T&gt; Publish(T message, string correlationId = null);
-
-        /// &lt;summary&gt;
-        /// 回发
-        /// &lt;/summary&gt;
-        /// &lt;typeparam name="TReply"&gt;回发消息类型&lt;/typeparam&gt;
-        /// &lt;param name="callback"&gt;回调函数&lt;/param&gt;
-        /// &lt;param name="replyRoutingKey"&gt;回发路由键 (默认: r.routingKey)&lt;/param&gt;
-        IMessageProducer&lt;T&gt; ReplyTo&lt;TReply&gt;(Func&lt;IMessage&lt;TReply&gt;, bool&gt; callback, string replyRoutingKey = null);
     }
 }</value>
     <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\Roles\IMessageProducer`1.cs</comment>
@@ -1949,68 +2252,50 @@ namespace RabbitMQ.Client
         IConnection CreateConnection();
 
         /// &lt;summary&gt;
+        /// 测试连接
+        /// &lt;/summary&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        bool TestConnection();
+
+        /// &lt;summary&gt;
         /// 创建生产者
         /// &lt;/summary&gt;
-        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
-        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
-        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
-        /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
         /// &lt;returns&gt;&lt;/returns&gt;
-        IMessageProducer CreateProducer(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        IMessageProducer CreateProducer();
 
         /// &lt;summary&gt;
         /// 创建生产者
         /// &lt;/summary&gt;
         /// &lt;typeparam name="T"&gt;消息类型&lt;/typeparam&gt;
-        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
-        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
-        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
-        /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
         /// &lt;returns&gt;&lt;/returns&gt;
-        IMessageProducer&lt;T&gt; CreateProducer&lt;T&gt;(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        IMessageProducer&lt;T&gt; CreateProducer&lt;T&gt;();
 
         /// &lt;summary&gt;
         /// 创建消费者
         /// &lt;/summary&gt;
-        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
-        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
-        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
-        /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
         /// &lt;returns&gt;&lt;/returns&gt;
-        IMessageConsumer CreateConsumer(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        IMessageConsumer CreateConsumer();
 
         /// &lt;summary&gt;
         /// 创建消费者
         /// &lt;/summary&gt;
         /// &lt;typeparam name="T"&gt;消息类型&lt;/typeparam&gt;
-        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
-        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
-        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
-        /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
         /// &lt;returns&gt;&lt;/returns&gt;
-        IMessageConsumer&lt;T&gt; CreateConsumer&lt;T&gt;(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        IMessageConsumer&lt;T&gt; CreateConsumer&lt;T&gt;();
 
         /// &lt;summary&gt;
         /// 创建远程过程
         /// &lt;/summary&gt;
-        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
-        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
-        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
-        /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
         /// &lt;returns&gt;&lt;/returns&gt;
-        IRemoteProcedure CreateRemoteProcedure(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        IRemoteProcedure CreateRemoteProcedure();
 
         /// &lt;summary&gt;
         /// 创建远程过程
         /// &lt;/summary&gt;
         /// &lt;typeparam name="TSource"&gt;传入类型&lt;/typeparam&gt;
         /// &lt;typeparam name="TResult"&gt;传出类型&lt;/typeparam&gt;
-        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
-        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
-        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
-        /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
         /// &lt;returns&gt;&lt;/returns&gt;
-        IRemoteProcedure&lt;TSource, TResult&gt; CreateRemoteProcedure&lt;TSource, TResult&gt;(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        IRemoteProcedure&lt;TSource, TResult&gt; CreateRemoteProcedure&lt;TSource, TResult&gt;();
 
         /// &lt;summary&gt;
         /// 获取消息队列（当前全部消息枚举列表）
@@ -2035,7 +2320,8 @@ namespace RabbitMQ.Client
         /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
         /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
         /// &lt;param name="ttl"&gt;消息存活时长&lt;/param&gt;
-        void SetRoute(IModel channel, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
+        /// &lt;returns&gt;路由绑定信息&lt;/returns&gt;
+        IRouteBinding SetRoute(IModel channel, string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
 
     }
 }</value>
@@ -2043,6 +2329,7 @@ namespace RabbitMQ.Client
   </data>
   <data name="Framework_RabbitMQ_Client_Roles_IRemoteProcedure_cs" xml:space="preserve">
     <value>using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Threading.Tasks;
 
@@ -2061,19 +2348,14 @@ namespace RabbitMQ.Client
         IMqClient Client { get; }
 
         /// &lt;summary&gt;
-        /// 路由键
+        /// 绑定队列
         /// &lt;/summary&gt;
-        string RoutingKey { get; }
-
-        /// &lt;summary&gt;
-        /// 队列类型
-        /// &lt;/summary&gt;
-        string QueueType { get; }
-
-        /// &lt;summary&gt;
-        /// 消息存活时长
-        /// &lt;/summary&gt;
-        uint Ttl { get; }
+        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
+        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
+        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
+        /// &lt;param name="ttl"&gt;最大存活时长&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        IRemoteProcedure Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
 
         /// &lt;summary&gt;
         /// 同步调用
@@ -2100,8 +2382,31 @@ namespace RabbitMQ.Client
 }</value>
     <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\Roles\IRemoteProcedure.cs</comment>
   </data>
-  <data name="Framework_RabbitMQ_Client_Roles_IRemoteProcedure_1_cs" xml:space="preserve">
+  <data name="Framework_RabbitMQ_Client_Roles_IRouteBinding_cs" xml:space="preserve">
+    <value>using RabbitMQ.Client;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+
+namespace RabbitMQ.Client
+{
+    public interface IRouteBinding : IDisposable
+    {
+        IModel Channel { get; }
+        string RoutingKey { get; }
+        ExchangeModes ExchangeMode { get; }
+        string QueueType { get; }
+        uint TimeToLive { get; }
+        uint MessageCount { get; set; }
+    }
+}</value>
+    <comment>${SLN}$\${NR}$.Framework\RabbitMQ.Client\Roles\IRouteBinding.cs</comment>
+  </data>
+  <data name="Framework_RabbitMQ_Client_Roles_IRemoteProcedure_2_cs" xml:space="preserve">
     <value>using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Threading.Tasks;
 
@@ -2120,19 +2425,14 @@ namespace RabbitMQ.Client
         IMqClient Client { get; }
 
         /// &lt;summary&gt;
-        /// 路由键
+        /// 绑定队列
         /// &lt;/summary&gt;
-        string RoutingKey { get; }
-
-        /// &lt;summary&gt;
-        /// 队列类型
-        /// &lt;/summary&gt;
-        string QueueType { get; }
-
-        /// &lt;summary&gt;
-        /// 消息存活时长
-        /// &lt;/summary&gt;
-        uint Ttl { get; }
+        /// &lt;param name="routingKey"&gt;路由键&lt;/param&gt;
+        /// &lt;param name="exchangeMode"&gt;交换模式&lt;/param&gt;
+        /// &lt;param name="queueType"&gt;队列类型&lt;/param&gt;
+        /// &lt;param name="ttl"&gt;最大存活时长&lt;/param&gt;
+        /// &lt;returns&gt;&lt;/returns&gt;
+        IRemoteProcedure&lt;TSource, TResult&gt; Bind(string routingKey, ExchangeModes exchangeMode = ExchangeModes.Normal, string queueType = null, uint ttl = 0);
 
         /// &lt;summary&gt;
         /// 同步调用
